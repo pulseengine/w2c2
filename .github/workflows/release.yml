@@ -1,0 +1,269 @@
+name: Release
+
+# Signed builds of upstream w2c2 (turbolent/w2c2), which publishes no releases.
+# This fork exists so the pulseengine-wasm varve layer can carry w2c2 with the
+# org's release bar: static musl and aarch64-darwin archives and a CycloneDX
+# SBOM, all inside SHA256SUMS.txt, which cosign signs keyless; SLSA provenance
+# for the archives; build-env.txt.
+#
+# A tag names the upstream commit it builds: v<YYYY.MM.DD>-<sha7>, the UTC
+# committer date and short hash of a turbolent/w2c2 commit. The guard refuses
+# the tag unless the tagged tree equals that commit everywhere outside
+# .github/, so the archives are upstream's source and nothing else.
+#
+# Each archive carries what a user of the generated C needs beside the
+# compiler: `w2c2`, `include/w2c2_base.h` (every generated file includes it)
+# and the WASI runtime sources under `wasi/`.
+#
+# Signing happens only in a run for a tag ref, so the keyless certificate
+# names release.yml@refs/tags/<tag>. To retry a failed tag run, use "Re-run
+# failed jobs", which keeps the tag ref. Runners are GitHub-hosted and pinned;
+# the only token is the job token.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  source-guard:
+    name: Tag names an upstream commit, and the tree is that commit
+    runs-on: ubuntu-24.04
+    outputs:
+      upstream: ${{ steps.guard.outputs.upstream }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Check the tag against the upstream commit
+        id: guard
+        run: |
+          set -euo pipefail
+          case "$GITHUB_REF" in refs/tags/v*) ;; *) echo "not a v* tag: $GITHUB_REF"; exit 1 ;; esac
+          tag="${GITHUB_REF#refs/tags/v}"
+          [[ "$tag" =~ ^([0-9]{4}\.[0-9]{2}\.[0-9]{2})-([0-9a-f]{7})$ ]] \
+            || { echo "tag v$tag is not v<YYYY.MM.DD>-<sha7>"; exit 1; }
+          date="${BASH_REMATCH[1]}"; short="${BASH_REMATCH[2]}"
+          upstream=$(git rev-parse --verify "${short}^{commit}")
+          git merge-base --is-ancestor "$upstream" HEAD \
+            || { echo "$upstream is not an ancestor of the tagged commit"; exit 1; }
+          got=$(TZ=UTC git log -1 --date=format-local:%Y.%m.%d --format=%cd "$upstream")
+          [ "$got" = "$date" ] || { echo "commit $short is dated $got (UTC), tag says $date"; exit 1; }
+          if ! git diff --quiet "$upstream" HEAD -- . ':(exclude).github'; then
+            echo "the tagged tree differs from $upstream outside .github/:"
+            git diff --stat "$upstream" HEAD -- . ':(exclude).github'
+            exit 1
+          fi
+          echo "upstream=$upstream" >> "$GITHUB_OUTPUT"
+          echo "builds turbolent/w2c2 at $upstream ($date)"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: [source-guard]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+            musl: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            musl: true
+          # No Intel macOS build: dropped fleet-wide by owner decision 2026-11-20.
+          - target: aarch64-apple-darwin
+            os: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install musl toolchain
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      # libdwarf is optional (only -g uses it) and would be a dynamic
+      # dependency, so pkg-config is kept out of the build.
+      - name: Build w2c2
+        env:
+          MUSL: ${{ matrix.musl }}
+        run: |
+          set -euo pipefail
+          args=(-DCMAKE_BUILD_TYPE=Release -DCMAKE_DISABLE_FIND_PACKAGE_PkgConfig=ON)
+          if [ "$MUSL" = "true" ]; then
+            args+=(-DCMAKE_C_COMPILER=musl-gcc -DCMAKE_EXE_LINKER_FLAGS=-static)
+          fi
+          cmake -S . -B build "${args[@]}"
+          cmake --build build --target w2c2 -j 4
+      - name: Package archive
+        env:
+          TARGET: ${{ matrix.target }}
+          UPSTREAM: ${{ needs.source-guard.outputs.upstream }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF#refs/tags/}"
+          ARCHIVE="w2c2-${VERSION}-${TARGET}.tar.gz"
+          mkdir -p staging/include staging/wasi
+          cp build/w2c2/w2c2 staging/
+          strip staging/w2c2
+          cp w2c2/w2c2_base.h staging/include/
+          cp wasi/*.c wasi/*.h staging/wasi/
+          cp README.md LICENSE staging/
+          echo "turbolent/w2c2 $UPSTREAM" > staging/SOURCE
+          tar -czf "$ARCHIVE" -C staging .
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+      # The archive a user downloads, not the loose build output: translate a
+      # module and compile the C against the header the archive carries.
+      - name: Smoke-test the packaged compiler
+        env:
+          MUSL: ${{ matrix.musl }}
+        run: |
+          set -euo pipefail
+          mkdir -p smoke && tar -xzf "$ARCHIVE" -C smoke
+          cd smoke
+          if [ "$MUSL" = "true" ]; then
+            file w2c2 | grep -q 'statically linked' || { file w2c2; exit 1; }
+          fi
+          printf '\x00\x61\x73\x6d\x01\x00\x00\x00\x01\x05\x01\x60\x00\x01\x7f\x03\x02\x01\x00\x07\x07\x01\x03\x61\x6e\x73\x00\x00\x0a\x06\x01\x04\x00\x41\x2a\x0b' > m.wasm
+          ./w2c2 m.wasm m.c
+          grep -q '"ans"' m.c
+          cc -I include -c m.c -o m.o
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: binary-${{ matrix.target }}
+          path: ${{ env.ARCHIVE }}
+          retention-days: 7
+
+  release:
+    name: Create GitHub Release
+    needs: [source-guard, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: artifacts
+      - name: Flatten release assets
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF#refs/tags/}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "BARE=${VERSION#v}" >> "$GITHUB_ENV"
+          mkdir -p release-assets
+          find artifacts -type f -name "*.tar.gz" -exec cp {} release-assets/ \;
+          n=$(find release-assets -name '*.tar.gz' | wc -l)
+          test "$n" -eq 3 || { echo "expected 3 archives, found $n"; exit 1; }
+          ls -la release-assets/
+      # w2c2 has no third-party dependencies: the SBOM names the one
+      # component and the upstream commit it is built from. It goes in before
+      # the sums, so its digest is signed too.
+      - name: Write the SBOM
+        env:
+          UPSTREAM: ${{ needs.source-guard.outputs.upstream }}
+        run: |
+          set -euo pipefail
+          cat > "release-assets/w2c2-${BARE}.cdx.json" <<EOF
+          {
+            "bomFormat": "CycloneDX",
+            "specVersion": "1.5",
+            "version": 1,
+            "metadata": {
+              "component": {
+                "type": "application",
+                "name": "w2c2",
+                "version": "${BARE}",
+                "licenses": [{ "license": { "id": "MIT" } }],
+                "externalReferences": [
+                  { "type": "vcs", "url": "https://github.com/turbolent/w2c2/tree/${UPSTREAM}" },
+                  { "type": "distribution", "url": "https://github.com/pulseengine/w2c2/releases/tag/${VERSION}" }
+                ]
+              }
+            },
+            "components": []
+          }
+          EOF
+          python3 -m json.tool "release-assets/w2c2-${BARE}.cdx.json" > /dev/null
+      - name: Capture build environment
+        env:
+          UPSTREAM: ${{ needs.source-guard.outputs.upstream }}
+        run: |
+          set -euo pipefail
+          {
+            echo "source: turbolent/w2c2 ${UPSTREAM}"
+            echo "linux: musl-gcc (musl-tools, ubuntu-24.04 / ubuntu-24.04-arm), -static"
+            echo "macos: Apple clang (macos-15)"
+            echo "cosign: v2.4.1 (sigstore/cosign-installer, pinned below)"
+            echo "runner: $(uname -srm)"
+          } > release-assets/build-env.txt
+          cat release-assets/build-env.txt
+      - name: Generate SHA256 checksums
+        run: |
+          set -euo pipefail
+          cd release-assets
+          sha256sum ./* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      # Nothing is attested or signed from a branch, whatever started the run.
+      - name: Sign only from a tag ref
+        run: |
+          case "$GITHUB_REF" in refs/tags/v*) ;; *) echo "not a v* tag: $GITHUB_REF"; exit 1 ;; esac
+      - name: Generate SLSA build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: "release-assets/*.tar.gz"
+      - name: Install cosign
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          cosign-release: 'v2.4.1'
+      - name: Sign SHA256SUMS with cosign (keyless OIDC)
+        run: |
+          set -euo pipefail
+          cd release-assets
+          cosign sign-blob \
+            --yes \
+            --bundle SHA256SUMS.txt.cosign.bundle \
+            --output-signature SHA256SUMS.txt.sig \
+            --output-certificate SHA256SUMS.txt.pem \
+            SHA256SUMS.txt
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          UPSTREAM: ${{ needs.source-guard.outputs.upstream }}
+        run: |
+          set -euo pipefail
+          notes=$(mktemp)
+          cat > "$notes" <<EOF
+          A signed build of upstream w2c2 at turbolent/w2c2@${UPSTREAM}. The tagged tree equals that commit outside .github/.
+
+          Each archive holds \`w2c2\`, \`include/w2c2_base.h\` (every generated C file includes it), the WASI runtime sources under \`wasi/\`, README, LICENSE and SOURCE.
+
+          Verify this release:
+
+              cosign verify-blob \\
+                --certificate-identity 'https://github.com/pulseengine/w2c2/.github/workflows/release.yml@refs/tags/${VERSION}' \\
+                --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \\
+                --bundle SHA256SUMS.txt.cosign.bundle SHA256SUMS.txt
+              sha256sum -c --ignore-missing SHA256SUMS.txt
+              gh attestation verify w2c2-${VERSION}-<target>.tar.gz --repo pulseengine/w2c2
+          EOF
+          # Never overwrite published assets: to re-run, delete the release.
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            echo "release $VERSION already exists; delete it before re-running" >&2
+            exit 1
+          fi
+          gh release create "$VERSION" --verify-tag --title "w2c2 $VERSION" \
+            --notes-file "$notes" --prerelease release-assets/*
