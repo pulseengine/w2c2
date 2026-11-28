@@ -1,0 +1,14 @@
+version: 2
+updates:
+  # github-actions only: this fork mirrors upstream outside .github/, and the
+  # release guard refuses a tag when the tree differs there.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+    groups:
+      github-actions-all:
+        patterns:
+          - '*'
